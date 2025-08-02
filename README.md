@@ -1,24 +1,39 @@
-Processor और Platform:
+# 🔗 Bank Integration with SAP B1 using .NET
 
-Realme X7 Max और Realme GT Neo दोनों में MediaTek Dimensity 1200 प्रोसेसर होता है, इसलिए इनके motherboard की architecture काफी हद तक मिलती-जुलती है।
+This project demonstrates a real-time **Bank API integration** with **SAP Business One** using **C# (.NET)** and **DIAPI/Service Layer**. The integration allows for seamless communication between SAP B1 and the bank's systems for processes like transaction updates, balance checks, auto reconciliation, and more.
 
-Region और Branding:
+---
 
-Realme GT Neo मुख्यतः China के लिए release हुआ था।
+## 📌 Features
 
-Realme X7 Max लगभग वही phone है, लेकिन इसे India के लिए rebranded किया गया।
+- ✅ Real-time fund status update
+- ✅ Transaction posting from SAP B1 to Bank API
+- ✅ Auto reconciliation of bank statements
+- ✅ Secure API calls with encryption and authentication
+- ✅ Logging and error handling
+- ✅ Configurable endpoint and token management
 
-Minor Differences:
+---
 
-PCB layout, connectors, और कुछ components जैसे modem bands, charging IC, या antenna placement अलग हो सकते हैं।
+## 🛠️ Technologies Used
 
-Software और regional customizations की वजह से hardware-level compatibility issue आ सकता है।
+- C# (.NET Framework)
+- SAP B1 SDK (DIAPI/Service Layer)
+- SQL Server / SAP HANA
+- REST APIs / JSON
+- Windows Service / Scheduled Task (for automation)
+- Logging using Log4Net / NLog
 
-Repair या Replacement के लिहाज से:
-आप theoretically एक का board दूसरे में लगा सकते हैं, लेकिन practical में हमेशा 100% compatibility की guarantee नहीं होती।
+---
 
-Fingerprint sensor, camera, या display connector mismatch हो सकता है।
+## 🧩 Project Structure
 
-अगर आप repairing या board replacement की सोच रहे हैं, तो safest तरीका यही है कि उसी model का original board ही use करें।
-
-अगर आप चाहें तो मैं दोनों models की comparison या PCB diagram देखने की कोशिश भी कर सकता हूँ।
+```plaintext
+/BankIntegration
+├── /Models
+├── /Services
+├── /Utils
+├── /SAPIntegration
+├── /BankAPI
+├── /Logs
+└── Program.cs
