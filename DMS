@@ -1,0 +1,709 @@
+using System;
+using System.Data;
+using System.Diagnostics;
+using System.ServiceProcess;
+using System.IO;
+using System.Xml;
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+using System.Data.SqlClient;
+using System.Data.OleDb;
+using System.Globalization;
+using System.Configuration;
+using System.Windows.Forms;
+using System.Collections;
+using System.Text;
+using System.Management;
+using System.Net.Mail;
+using System.Data.Odbc;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Net.Security;
+using Newtonsoft.Json;
+
+namespace SERVICE_SAP_TO_DMS
+{
+    partial class Service1 : ServiceBase
+    {    
+        OdbcDataAdapter oDataAdapterGetAutoMailData, oDataAdapterSendMailData;
+        System.Data.DataSet dsGetAutoMailData, dsSendMailData;
+        string _strCanceled = string.Empty;
+        int DocEntry = default(int);
+        SAPbobsCOM.Recordset ORecordset;
+        string _aRInvoiceNumber = string.Empty;
+        public Service1()
+        {
+            InitializeComponent();
+            try
+            {
+                string companyDataFile = Application.StartupPath + "/Settings.txt";
+                List<string> companyData = new List<string>();
+                using (StreamReader reader = new StreamReader(companyDataFile))
+                {
+                    while (reader.Peek() >= 0)
+                    {
+                        companyData.Add(reader.ReadLine());
+                    }
+                }
+                for (int i = 0; i < companyData.Count; i++)
+                {
+                    string[] dataDetail = companyData[i].Split('|');
+                    string companyServer = dataDetail[0];
+                    string companyDatabase = dataDetail[1];
+                    string dbUsernam = dataDetail[2];
+                    string dbPassword = dataDetail[3];
+                    string dbType = dataDetail[4];                   
+                    try
+                    {
+                        ClsSBOAddOn.SetApplication(companyServer, companyDatabase, dbUsernam, dbPassword, dbType);
+                        if (ClsSBOAddOn.mCompany.Connected)
+                        {
+                            ClsSBOAddOn.WriteMessage("Process Start.......");
+                            SAPbobsCOM.Recordset oRs = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+                            string Query = "SELECT DISTINCT \"CANCELED\",\"DocEntry\" ,\"U_FinalInv\"" +
+                                           "\r\n FROM OINV " +
+                                           "\r\n WHERE  ((IFNULL(\"U_DMSStatus\",'') = '' ) OR (\"U_DMSStatus\"='Failed')) AND IFNULL(\"U_RESP_DOCNUM\",'') = '' AND \"DocType\"='I' ";
+
+
+                            oRs.DoQuery(Query);
+                            int RecordCount = oRs.RecordCount;
+                            if (oRs.RecordCount > 0)
+                            {
+                                int count = 1;
+                                while (!oRs.EoF)
+                                {
+                                    string DocEntry = Convert.ToString(oRs.Fields.Item("DocEntry").Value);
+                                    #region PROCESS TO FLOW DATA FROM SAP 
+                                    #region PUSH CANCELED DATA CHECK ONLY
+                                    _strCanceled = Convert.ToString(oRs.Fields.Item("CANCELED").Value);
+                                    string FinalFlag = Convert.ToString(oRs.Fields.Item("U_FinalInv").Value);
+                                    if (_strCanceled == "C")
+                                    {
+                                        FinalFlag = "N";
+                                    }
+                                    #endregion
+                                    if ((FinalFlag == "N" || string.IsNullOrEmpty(FinalFlag)))
+                                    {
+                                        ProcessToFlowDataFromSAP(_strCanceled, DocEntry);
+                                    }
+                                    #endregion
+                                    oRs.MoveNext();
+                                    ClsSBOAddOn.WriteMessage("Record No" + count + "    With DocEntry No :" + DocEntry);
+                                    count++;
+                                }
+                                System.Runtime.InteropServices.Marshal.ReleaseComObject(oRs);
+                            }
+                        }
+                    }
+                    catch (Exception Ex)
+                    {
+                        ClsSBOAddOn.WriteMessage("Error in transaction");
+                        ClsSBOAddOn.WriteMessage(Ex.Message);
+                    }                    
+                }
+                ClsSBOAddOn.WriteMessage("Process Completed...");
+                Environment.Exit(0);
+            }
+            catch (Exception Ex)
+            {
+                ClsSBOAddOn.WriteMessage(Ex.Message);
+            }
+            finally
+            {
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(ClsSBOAddOn.mCompany);
+            }            
+        }
+        
+        protected override void OnStop()
+        {
+            // TODO: Add code here to perform any tear-down necessary to stop your service.
+        }
+        #region PROCESS TO FLOW DATA FROM SAP
+        private void ProcessToFlowDataFromSAP(string IsCancelled,string DocEntry)
+        {
+            string Query = string.Empty;
+            try
+            {
+                #region  NORMAL INVOICE DATA DATED 03-06-2023
+                if (IsCancelled == "N")
+                {
+                    Query = "CALL UTL_GET_SalesInvoiceDATA ('" + DocEntry + "')";
+                    SAPbobsCOM.Recordset  ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+                    ORecordset.DoQuery(Query);
+
+                    if (ORecordset.RecordCount > 0)
+                    {
+                        #region Get/Set Properties
+
+                        List<SalesInvoiceModel> oDocumentL = new List<SalesInvoiceModel>();
+                        SalesInvoiceModel oDocument = new SalesInvoiceModel();
+                        List<SalesInvoiceLineDetail> lineDetails = new List<SalesInvoiceLineDetail>();
+                        for (int i = 1; i <= ORecordset.RecordCount; i++)
+                        {
+                            if (i == 1)
+                            {
+                                oDocument.Customer_Code = Convert.ToString(ORecordset.Fields.Item("Customer_Code").Value);
+                                oDocument.Customer_Name = Convert.ToString(ORecordset.Fields.Item("Customer_Name").Value);
+                                oDocument.Cust_Ref_No = Convert.ToString(ORecordset.Fields.Item("Cust_Ref_No").Value);
+                                oDocument.Doc_No = Convert.ToString(ORecordset.Fields.Item("Doc_No").Value);
+                                oDocument.Doc_Date = Convert.ToString(ORecordset.Fields.Item("Doc_Date").Value);
+                                oDocument.DMS_Order_No = Convert.ToString(ORecordset.Fields.Item("DMS_Order_No").Value);
+                                oDocument.Remarks = Convert.ToString(ORecordset.Fields.Item("Remarks").Value);
+                                oDocument.Total_After_Discount_Value = Convert.ToString(ORecordset.Fields.Item("Total_After_Discount_Value").Value);
+                                oDocument.Freight_Insurance = Convert.ToString(ORecordset.Fields.Item("Freight_Insurance").Value);
+                                oDocument.Total_Tax = Convert.ToString(ORecordset.Fields.Item("Total_Tax").Value);
+                                oDocument.Document_Value = Convert.ToString(ORecordset.Fields.Item("Document_Value").Value);
+                                oDocument.Sale_Employee_Code = Convert.ToString(ORecordset.Fields.Item("Sale_Employee_Code").Value);
+                                oDocument.Line_Item_Code = Convert.ToString(ORecordset.Fields.Item("Line_Item_Code").Value);
+                                oDocument.Whse_Code = Convert.ToString(ORecordset.Fields.Item("Whse_Code").Value);
+                                oDocument.Alert_ID = Convert.ToString(ORecordset.Fields.Item("Alert_ID").Value);
+                                oDocument.Total_Freight_Value = Convert.ToString(ORecordset.Fields.Item("Total_Freight_Value").Value);
+                                oDocument.Total_Freight_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Total_Freight_Tax_Value").Value);
+                                oDocument.Total_Insurance_Value = Convert.ToString(ORecordset.Fields.Item("Total_Insurance_Value").Value);
+                                oDocument.Total_Insurance_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Total_Insurance_Tax_Value").Value);
+                            }
+                            SalesInvoiceLineDetail oLine = new SalesInvoiceLineDetail();
+                            oLine.HSN_Code = Convert.ToString(ORecordset.Fields.Item("HSN_Code").Value);
+                            oLine.DO_Number = Convert.ToString(ORecordset.Fields.Item("DO_Number").Value);
+                            oLine.DO_Line_Number = Convert.ToString(ORecordset.Fields.Item("DO_Line_Number").Value);
+                            oLine.Item_No = Convert.ToString(ORecordset.Fields.Item("Item_No").Value);
+                            oLine.Item_Description = Convert.ToString(ORecordset.Fields.Item("Item_Description").Value);
+                            oLine.Quantity = Convert.ToString(ORecordset.Fields.Item("Quantity").Value);
+                            oLine.Unit_Price = Convert.ToString(ORecordset.Fields.Item("Unit_Price").Value);
+                            oLine.Discount_Amount = Convert.ToString(ORecordset.Fields.Item("Discount_Amount").Value);
+                            oLine.Price_After_Discount = Convert.ToString(ORecordset.Fields.Item("Price_After_Discount").Value);
+                            oLine.Scheme_Name = Convert.ToString(ORecordset.Fields.Item("Scheme_Name").Value);
+                            oLine.Sales_Uom = Convert.ToString(ORecordset.Fields.Item("Sales_Uom").Value);
+                            oLine.Tax_Amount = Convert.ToString(ORecordset.Fields.Item("Tax_Amount").Value);
+                            oLine.Freight_Value = Convert.ToString(ORecordset.Fields.Item("Freight_Value").Value);
+                            oLine.Insurance_Value = Convert.ToString(ORecordset.Fields.Item("Insurance_Value").Value);
+                            oLine.Freight_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Freight_Tax_Value").Value);
+                            oLine.Insurance_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Insurance_Tax_Value").Value);
+                            oLine.Others_Freight_Value = Convert.ToString(ORecordset.Fields.Item("Others_Freight_Value").Value);
+                            oLine.Others_Freight_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Others_Freight_Tax_Value").Value);
+                            oLine.Total_Value = Convert.ToString(ORecordset.Fields.Item("Total_Value").Value);
+                            oLine.Sap_So_No = Convert.ToString(ORecordset.Fields.Item("Sap_So_No").Value);
+                            lineDetails.Add(oLine);
+                            ORecordset.MoveNext();
+                        }
+                        oDocument.LineDetails = lineDetails;
+                        oDocumentL.Add(oDocument);
+                        #endregion
+                        #region SendDataFromSAPToDMS
+                        string ResponseStatus = SendDataFromSAPToDMS(oDocumentL, DocEntry);
+                        #endregion
+
+                        #region UPDATE RESPONSE STATUS AND AR INVOICE NUMBER /FINAL QUOTATION SUBMITTED FLAG IN SALES QUOTATION
+
+                        if ((ResponseStatus).ToUpper() == "SUCCESS" && (!string.IsNullOrEmpty(_aRInvoiceNumber)))
+                        {
+                            UpdateAPIResponseStatus(ResponseStatus, DocEntry, _aRInvoiceNumber);
+                            ClsSBOAddOn.WriteMessage(ResponseStatus + "DocEntry:--" + DocEntry + "AR Invoice No.:--" + _aRInvoiceNumber);
+                        }
+                        else
+                        {
+                            UpdateAPIResponseStatus("Failed", DocEntry, _aRInvoiceNumber);
+                        }
+
+                        #endregion
+                        #region MESSAGE TO DISPLAY FINAL SUBMISSION RESPONSE
+                        if ((ResponseStatus).ToUpper() == "SUCCESS" && (!string.IsNullOrEmpty(_aRInvoiceNumber)))
+                        {
+                            ClsSBOAddOn.WriteMessage("Sales Invoice Successfully posted in DMS with AR Invoice No.:--"+ _aRInvoiceNumber);                           
+                        }
+                        else
+                        {
+                            ClsSBOAddOn.WriteMessage("Sales Invoice Failed to Post in DMS!");                           
+                        }
+                        #endregion
+
+                    }
+                }
+                #endregion
+                #region  CANCILLATION INVOICE DATA DATED 03-06-2023
+                if (IsCancelled == "C")
+                {   
+                    Query = "CALL UTL_GET_SalesInvoice_Cancellation_DATA ('" + DocEntry + "')";
+                    ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+                    ORecordset.DoQuery(Query);
+                    if (ORecordset.RecordCount > 0)
+                    {
+                        #region Get/Set Properties
+                        List<SalesInvoiceModel> oDocumentL = new List<SalesInvoiceModel>();
+                        SalesInvoiceModel oDocument = new SalesInvoiceModel();
+                        List<SalesInvoiceLineDetail> lineDetails = new List<SalesInvoiceLineDetail>();
+                        for (int i = 1; i <= ORecordset.RecordCount; i++)
+                        {
+                            if (i == 1)
+                            {
+                                oDocument.Customer_Code = Convert.ToString(ORecordset.Fields.Item("Customer_Code").Value);
+                                oDocument.Customer_Name = Convert.ToString(ORecordset.Fields.Item("Customer_Name").Value);
+                                oDocument.Cust_Ref_No = Convert.ToString(ORecordset.Fields.Item("Cust_Ref_No").Value);
+                                oDocument.Doc_No = Convert.ToString(ORecordset.Fields.Item("Doc_No").Value);
+                                oDocument.Doc_Date = Convert.ToString(ORecordset.Fields.Item("Doc_Date").Value);
+                                oDocument.DMS_Order_No = Convert.ToString(ORecordset.Fields.Item("DMS_Order_No").Value);
+                                oDocument.Remarks = Convert.ToString(ORecordset.Fields.Item("Remarks").Value);
+                                oDocument.Total_After_Discount_Value = Convert.ToString(ORecordset.Fields.Item("Total_After_Discount_Value").Value);
+                                oDocument.Freight_Insurance = Convert.ToString(ORecordset.Fields.Item("Freight_Insurance").Value);
+                                oDocument.Total_Tax = Convert.ToString(ORecordset.Fields.Item("Total_Tax").Value);
+                                oDocument.Document_Value = Convert.ToString(ORecordset.Fields.Item("Document_Value").Value);
+                                oDocument.Sale_Employee_Code = Convert.ToString(ORecordset.Fields.Item("Sale_Employee_Code").Value);
+                                oDocument.Line_Item_Code = Convert.ToString(ORecordset.Fields.Item("Line_Item_Code").Value);
+                                oDocument.Whse_Code = Convert.ToString(ORecordset.Fields.Item("Whse_Code").Value);
+                                oDocument.Alert_ID = Convert.ToString(ORecordset.Fields.Item("Alert_ID").Value);
+                                oDocument.Total_Freight_Value = Convert.ToString(ORecordset.Fields.Item("Total_Freight_Value").Value);
+                                oDocument.Total_Freight_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Total_Freight_Tax_Value").Value);
+                                oDocument.Total_Insurance_Value = Convert.ToString(ORecordset.Fields.Item("Total_Insurance_Value").Value);
+                                oDocument.Total_Insurance_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Total_Insurance_Tax_Value").Value);
+                                }
+                            SalesInvoiceLineDetail oLine = new SalesInvoiceLineDetail();
+                            oLine.HSN_Code = Convert.ToString(ORecordset.Fields.Item("HSN_Code").Value);
+                            oLine.DO_Number = Convert.ToString(ORecordset.Fields.Item("DO_Number").Value);
+                            oLine.DO_Line_Number = Convert.ToString(ORecordset.Fields.Item("DO_Line_Number").Value);
+                            oLine.Item_No = Convert.ToString(ORecordset.Fields.Item("Item_No").Value);
+                            oLine.Item_Description = Convert.ToString(ORecordset.Fields.Item("Item_Description").Value);
+                            oLine.Quantity = Convert.ToString(ORecordset.Fields.Item("Quantity").Value);
+                            oLine.Unit_Price = Convert.ToString(ORecordset.Fields.Item("Unit_Price").Value);
+                            oLine.Discount_Amount = Convert.ToString(ORecordset.Fields.Item("Discount_Amount").Value);
+                            oLine.Price_After_Discount = Convert.ToString(ORecordset.Fields.Item("Price_After_Discount").Value);
+                            oLine.Scheme_Name = Convert.ToString(ORecordset.Fields.Item("Scheme_Name").Value);
+                            oLine.Sales_Uom = Convert.ToString(ORecordset.Fields.Item("Sales_Uom").Value);
+                            oLine.Tax_Amount = Convert.ToString(ORecordset.Fields.Item("Tax_Amount").Value);
+                            //oLine.Freight_Value = Convert.ToString(ORecordset.Fields.Item("Freight_Value").Value);
+                            //oLine.Insurance_Value = Convert.ToString(ORecordset.Fields.Item("Insurance_Value").Value);
+                            //oLine.Freight_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Freight_Tax_Value").Value);
+                            //oLine.Insurance_Tax_Value = Convert.ToString(ORecordset.Fields.Item("Insurance_Tax_Value").Value);
+                            oLine.Total_Value = Convert.ToString(ORecordset.Fields.Item("Total_Value").Value);
+                            oLine.Sap_So_No = Convert.ToString(ORecordset.Fields.Item("Sap_So_No").Value);
+                            lineDetails.Add(oLine);
+                            ORecordset.MoveNext();
+                        }
+                        oDocument.LineDetails = lineDetails;
+                        oDocumentL.Add(oDocument);
+                        #endregion
+                        #region SendDataFromSAPToDMS
+                        string ResponseStatus = SendDataFromSAPToDMS(oDocumentL, DocEntry);
+                        #endregion
+
+                        #region UPDATE RESPONSE STATUS AND AR INVOICE NUMBER/FINAL QUOTATION SUBMITTED FLAG IN SALES QUOTATION
+                        if ((ResponseStatus).ToUpper() == "SUCCESS" && (!string.IsNullOrEmpty(_aRInvoiceNumber)))
+                        {
+                            UpdateAPIResponseStatus(ResponseStatus, DocEntry, _aRInvoiceNumber);
+                            ClsSBOAddOn.WriteMessage(ResponseStatus + "DocEntry:--" + DocEntry);
+                        }
+                        else
+                        {
+                            UpdateAPIResponseStatus("Failed", DocEntry, _aRInvoiceNumber);
+                        }
+
+                        #endregion
+
+                        #region Message To display Final Submission Response
+
+                        if ((ResponseStatus).ToUpper() == "SUCCESS" && (!string.IsNullOrEmpty(_aRInvoiceNumber)))
+                        {
+                            ClsSBOAddOn.WriteMessage("Sales Invoice Successfully posted in DMS with AR Invoice Number is "+ _aRInvoiceNumber);                            
+                        }
+                        else
+                        {
+                            ClsSBOAddOn.WriteMessage("Sales Invoice Failed to Post in DMS!" + ResponseStatus);
+                        }
+
+                        #endregion
+                    }
+                }
+                #endregion
+
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("ProcessToFlowSQDataFromSAP:" + ex.Message);
+            }
+        }
+        #endregion
+        #region SEND DATA FROM SAP TO DMS
+        private string SendDataFromSAPToDMS(List<SalesInvoiceModel> oModel, string DocEntry)
+        {
+            try
+            {
+                try
+                {
+                    Setup();
+
+                    var setting = new JsonSerializerSettings()
+                    {
+                        NullValueHandling = NullValueHandling.Ignore
+                    };
+                    string json = JsonConvert.SerializeObject(oModel, setting);
+                    var data = Encoding.ASCII.GetBytes(json);
+                    //UpdateJSONRequest(json, DocEntry);                   
+                    string URI = ConfigurationSettings.AppSettings["URL"].ToString();
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(new Uri(URI));
+                    request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
+                    request.Method = "POST";
+                    request.KeepAlive = true;
+                    string authKey= ConfigurationSettings.AppSettings["AuthKeySalesInvoice"];
+                    request.Headers["auth_key"] = ConfigurationSettings.AppSettings["AuthKeySalesInvoice"];
+                    request.ContentType = "application/json;odata=minimalmetadata";
+                    request.ContentLength = data.Length;
+                    using (var stream = request.GetRequestStream())
+                    {
+                        stream.Write(data, 0, data.Length);
+                    }
+                    HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                    var responseString = new StreamReader(response.GetResponseStream()).ReadToEnd();
+                    SIDMSResponseModel oItemDMSResponse = new SIDMSResponseModel();
+                    SIDMSResponseModel ResponseEntity = JsonConvert.DeserializeObject<SIDMSResponseModel>(responseString);
+                    var DMSresponse = ResponseEntity.data;
+                    _aRInvoiceNumber = DMSresponse[0].doc_number;
+                    string Status = DMSresponse[0].status;
+                    response.Close();
+                    return Status;                   
+                }
+                catch (WebException ex)
+                {
+                    WebResponse response = ex.Response;
+                    ClsSBOAddOn.WriteMessage("Error:" + ex.Response);
+                    if (response == null)
+                    {
+
+                    }
+                    var responseString = new StreamReader(response.GetResponseStream()).ReadToEnd();
+
+                    return "Failed";                   
+
+                }                
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("SendDataFromSAPToDMS:" + ex.Message);               
+                return "Failed";
+            }
+        }
+        #endregion
+        #region SETUP
+        private void Setup()
+        {
+            ServicePointManager.ServerCertificateValidationCallback += delegate (object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors ssl)
+            { return true; };
+            ServicePointManager.Expect100Continue = false;
+            ServicePointManager.MaxServicePointIdleTime = 2000;
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Ssl3 | SecurityProtocolType.Tls;
+        }
+        #endregion
+        #region UPDATEJSON REQUEST
+        public void UpdateJSONRequest(string JSON, string DocEntry)
+        {
+            try
+            {
+
+                string UpdateQuery = "";
+                ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+
+                UpdateQuery = "UPDATE OINV SET \"U_ReqJSON\"='" + JSON + "' WHERE \"DocEntry\" = '" + DocEntry + "'";
+
+                ORecordset.DoQuery(UpdateQuery);
+                ClsSBOAddOn.WriteMessage("Data Sucessfully Update DocEntry:- " + DocEntry);
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("UpdateJSONRequest: " + ex.Message);                
+            }
+            finally
+            {
+                if (ORecordset != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(ORecordset);
+                }
+            }
+        }
+        #endregion
+        #region UPDATE API RESPONSE STATUS
+        public void UpdateAPIResponseStatus(string Status, string DocEntry,string DocNum)
+        {
+            try
+            {
+                string UpdateQuery = "";
+                ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+                if ((Status).ToUpper() == "SUCCESS" && (!string.IsNullOrEmpty(DocNum)))
+                {
+                    UpdateQuery = "UPDATE OINV SET \"U_DMSStatus\"='" + Status + "',\"U_RESP_DOCNUM\"='"+DocNum+"',\"U_FinalInv\"='Y' WHERE \"DocEntry\" = '" + DocEntry + "' AND \"DocNum\"='"+ DocNum + "'";
+                    ClsSBOAddOn.WriteMessage("Sucess: " + Status + "AR Invoice Number: " + DocNum + "-- -  Final Invoice Flag :'Y'");
+                }
+                else
+                {
+                    UpdateQuery = "UPDATE OINV SET \"U_DMSStatus\"='" + Status + "',\"U_FinalInv\"='N' WHERE \"DocEntry\" = '" + DocEntry + "'";                
+                    ClsSBOAddOn.WriteMessage("Sucess: " + Status + "AR Invoice Number: " + DocNum + "-- -  Final Invoice Flag :'N'");
+                }
+                ORecordset.DoQuery(UpdateQuery);
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("UpdateAPIResponseStatus:" + ex.Message);              
+                if (ORecordset != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(ORecordset);
+                }
+            }
+            finally
+            {
+                if (ORecordset != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(ORecordset);
+                }
+            }
+        }
+        #endregion
+        #region PROCESS TO FLOW DISPATCH SUMMARY
+        private void ProcessToFlowDispatchSummary(string DocEntry)
+        {
+            string Query = string.Empty;
+            try
+            {  
+                Query = "CALL UTL_GET_DISPATCH_SUMMARY ('" + DocEntry + "')";
+                ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+                ORecordset.DoQuery(Query);
+                if (ORecordset.RecordCount > 0)
+                {
+                    #region GET/SET PROPERTIES
+                    List<DispatchSummaryModel> oDocumentL = new List<DispatchSummaryModel>();
+                    DispatchSummaryModel oDocument = new DispatchSummaryModel();
+                    oDocument.customer_code = Convert.ToString(ORecordset.Fields.Item("customer_code").Value);
+                    oDocument.customer_name = Convert.ToString(ORecordset.Fields.Item("customer_name").Value);
+                    oDocument.document_number = Convert.ToString(ORecordset.Fields.Item("document_number").Value);
+                    oDocument.document_date = Convert.ToString(ORecordset.Fields.Item("document_date").Value);
+                    oDocument.transport = Convert.ToString(ORecordset.Fields.Item("transport").Value);
+                    oDocument.docket_no = Convert.ToString(ORecordset.Fields.Item("docket_no").Value);
+                    oDocument.docket_date = Convert.ToString(ORecordset.Fields.Item("docket_date").Value);
+                    oDocument.vehicle_number = Convert.ToString(ORecordset.Fields.Item("vehicle_number").Value);
+                    oDocument.total_box = Convert.ToString(ORecordset.Fields.Item("total_box").Value);
+                    oDocument.total_weight = Convert.ToString(ORecordset.Fields.Item("total_weight").Value);
+                    oDocument.place_of_supply = Convert.ToString(ORecordset.Fields.Item("place_of_supply").Value);
+                    oDocumentL.Add(oDocument);
+                    #endregion
+                    #region SendDataFromSAPToDMS
+                    ClsSBOAddOn.WriteMessage("Start Process");
+                    string ResponseStatus = SendDataFromSAPToDMS_ForDispatchSummary(oDocumentL, DocEntry);
+                    #endregion
+                    if ((ResponseStatus).ToUpper() == "SUCCESS")
+                    {
+                        UpdateAPIResponseStatus_ForDispatchSummary(ResponseStatus, DocEntry);
+                        ClsSBOAddOn.WriteMessage(ResponseStatus + "DocEntry:--" + DocEntry);
+                    }
+                    else
+                    {
+                        UpdateAPIResponseStatus_ForDispatchSummary("Failed", DocEntry);
+                    }
+                    #region MESSAGE TO DISPLAY SUBMISSION RESPONSE
+
+                    if ((ResponseStatus).ToUpper() == "SUCCESS")
+                    {
+                        ClsSBOAddOn.WriteMessage("Dispatch Summary posted in DMS!");                        
+                    }
+                    else
+                    {
+                        ClsSBOAddOn.WriteMessage("Dispatch Summary Failed to Post in DMS!" + ResponseStatus);
+                    }
+                    #endregion
+                    ClsSBOAddOn.WriteMessage("End Process");
+                }
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("ProcessToFlowSQDataFromSAP:" + ex.Message);               
+            }
+        }
+        #endregion
+        #region SEND DATA FROM SAP TO DMS FOR DISPATCH SUMMARY
+        private string SendDataFromSAPToDMS_ForDispatchSummary(List<DispatchSummaryModel> oModel, string DocEntry)
+        {
+            try
+            {
+                try
+                {
+                    Setup();
+                    var setting = new JsonSerializerSettings()
+                    {
+                        NullValueHandling = NullValueHandling.Ignore   
+                    };
+                    string json = JsonConvert.SerializeObject(oModel, setting);
+                    var data = Encoding.ASCII.GetBytes(json);
+                    UpdateJSONRequest_ForDispatchSummary(json, DocEntry);
+                    //TEST URL
+                    //string URI = "https://www.channelkonnect.com/ozonekonnect/ozone/dispatch_summary";
+                    //LIVE URL
+                    string URI = "https://ozone.channelkonnect.com/ozonekonnect/ozone/dispatch_summary";
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(new Uri(URI));
+                    request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore);
+                    request.Method = "POST";
+                    request.KeepAlive = true;
+                    request.Headers["auth"] = ConfigurationSettings.AppSettings["AuthKeyDispatchSummary"];
+                    request.ContentType = "application/json;odata=minimalmetadata";
+                    request.ContentLength = data.Length;
+                    using (var stream = request.GetRequestStream())
+                    {
+                        stream.Write(data, 0, data.Length);
+                    }
+                    HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                    var responseString = new StreamReader(response.GetResponseStream()).ReadToEnd();
+                    SIDMSResponseModel oItemDMSResponse = new SIDMSResponseModel();
+                    SIDMSResponseModel ResponseEntity = JsonConvert.DeserializeObject<SIDMSResponseModel>(responseString);
+                    string Status = ResponseEntity.type;
+                    response.Close();
+                    return Status;
+                }
+                catch (WebException ex)
+                {
+                    ClsSBOAddOn.WriteMessage("Error:" + ex.Message);
+                    WebResponse response = ex.Response;
+                    if (response == null)
+                    {
+
+                    }
+                    var responseString = new StreamReader(response.GetResponseStream()).ReadToEnd();
+
+                    return "Failed";
+                }
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("SendDataFromSAPToDMS_ForDispatchSummary:" + ex.Message);               
+                return "Failed";
+            }
+        }
+        #endregion
+        private void UpdateJSONRequest_ForDispatchSummary(string JSON, string DocEntry)
+        {
+            try
+            {
+                string UpdateQuery = "";
+                ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+
+                UpdateQuery = "UPDATE OINV SET \"U_ReqJSON_DS\"='" + JSON + "' WHERE \"DocEntry\" = '" + DocEntry + "'";
+
+                ORecordset.DoQuery(UpdateQuery);
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("UpdateJSONRequest_ForDispatchSummary:" + ex.Message);
+            }
+            finally
+            {
+                if (ORecordset != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(ORecordset);
+                }
+            }
+        }
+        private void UpdateAPIResponseStatus_ForDispatchSummary(string Status, string DocEntry)
+        {
+            try
+            {
+                string UpdateQuery = "";
+                ORecordset = (SAPbobsCOM.Recordset)ClsSBOAddOn.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
+
+                UpdateQuery = "UPDATE OINV SET \"U_DMSStatus_DS\"='" + Status + "' WHERE \"DocEntry\" = '" + DocEntry + "'";
+
+                ORecordset.DoQuery(UpdateQuery);
+            }
+            catch (Exception ex)
+            {
+                ClsSBOAddOn.WriteMessage("UpdateAPIResponseStatus_ForDispatchSummary:" + ex.Message);               
+            }
+            finally
+            {
+                if (ORecordset != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(ORecordset);
+                }
+            }
+        }
+        #region SALES INVOICE MODEL
+        class SalesInvoiceModel
+        {
+            public string Customer_Code { get; set; }
+            public string Customer_Name { get; set; }
+            public string Cust_Ref_No { get; set; }
+            public string Doc_No { get; set; }
+            public string Doc_Date { get; set; }
+            public string DMS_Order_No { get; set; }
+            public string Remarks { get; set; }
+            public string Total_After_Discount_Value { get; set; }
+            public string Freight_Insurance { get; set; }
+            public string Total_Tax { get; set; }
+            public string Document_Value { get; set; }
+            public string Sale_Employee_Code { get; set; }
+            public string Whse_Code { get; set; }
+            public string Line_Item_Code { get; set; }
+            public string Alert_ID { get; set; }
+            public string Total_Freight_Value { get; set; }
+            public string Total_Freight_Tax_Value { get; set; }
+            public string Total_Insurance_Value { get; set; }
+            public string Total_Insurance_Tax_Value { get; set; }
+            public List<SalesInvoiceLineDetail> LineDetails { get; set; }
+        }
+
+        public class SalesInvoiceLineDetail
+        {
+            public string HSN_Code { get; set; }
+            public string DO_Number { get; set; }
+            public string DO_Line_Number { get; set; }
+            public string Item_No { get; set; }
+            public string Item_Description { get; set; }
+            public string Quantity { get; set; }
+            public string Unit_Price { get; set; }
+            public string Discount_Amount { get; set; }
+            public string Price_After_Discount { get; set; }
+            public string Scheme_Name { get; set; }
+            public string Sales_Uom { get; set; }
+            public string Tax_Amount { get; set; }
+            public string Freight_Value { get; set; }
+            public string Freight_Tax_Value { get; set; }
+            public string Insurance_Value { get; set; }
+            public string Insurance_Tax_Value { get; set; }
+            public string Others_Freight_Value { get; set; }
+            public string Others_Freight_Tax_Value { get; set; }
+            public string Total_Value { get; set; }
+            public string Sap_So_No { get; set; }
+        }
+
+        public class SIDMSResponseModel
+        {
+            public string title { get; set; }
+            public string text { get; set; }
+            public string Uploaded_Ids { get; set; }
+            public string type { get; set; }
+
+            public List<SIDMSResponseModelDetails> data;
+
+        }
+        public class SIDMSResponseModelDetails
+        {
+            public string doc_number { get; set; }
+            public string status { get; set; }
+        }
+        #endregion
+        #region  DISPATCH SUMMARY MODEL
+        class DispatchSummaryModel
+        {
+            public string customer_code { get; set; }
+            public string customer_name { get; set; }
+            public string document_number { get; set; }
+            public string document_date { get; set; }
+            public string transport { get; set; }
+            public string docket_no { get; set; }
+            public string docket_date { get; set; }
+            public string vehicle_number { get; set; }
+            public string total_box { get; set; }
+            public string total_weight { get; set; }
+            public string place_of_supply { get; set; }
+        }
+        #endregion
+        public void onDebug()
+        {
+            OnStart(null);
+        }       
+    }
+}
+
+
